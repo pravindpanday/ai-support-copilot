@@ -18,29 +18,59 @@ Most RAG tutorials stop at "embed the docs, do cosine similarity, pass chunks to
 This project implements all four.
 
 ---
-
 ## Architecture
-    ┌──────────────┐
-    │   Next.js    │  Chat UI + streaming responses
-    │  App Router  │
-    └──────┬───────┘
-           │
-           ▼
-    ┌──────────────┐         ┌─────────────────┐
-    │  API Routes  │────────▶│   Claude API    │
-    │  (Edge/Node) │         │   (streaming)   │
-    └──────┬───────┘         └─────────────────┘
-           │
-   ┌───────┴────────┐
-   ▼                ▼
-  ┌────────────┐   ┌──────────────┐
-  │  Postgres  │   │   pgvector   │  Hybrid retrieval:
-  │  (convos,  │   │  (embeddings)│  vector sim + keyword rank
-  │   users,   │   └──────────────┘
-  │   RLS)     │
-  └────────────┘
 
-  ---
+### Query Path (runs on every user question)
+
+```mermaid
+flowchart TD
+    User([End User]) -->|asks question| UI[Next.js 14 Chat UI]
+    UI --> API[API Route / Edge Handler]
+    API --> DB[(Postgres<br/>conversations + RLS)]
+    API --> Embed[OpenAI Embeddings<br/>text-embedding-3-small]
+    Embed --> Retriever
+    DB -.conversation history.-> LLM
+    Vec[(pgvector<br/>doc chunk embeddings)] --> Retriever[Hybrid Retriever<br/>vector similarity + keyword rank]
+    Retriever -->|top-K chunks + metadata| LLM[Claude API<br/>streaming + grounded generation]
+    LLM -->|token stream + citations| UI
+    UI -->|rendered response| User
+
+    style User fill:#e1f5ff,stroke:#0288d1
+    style LLM fill:#fff4e1,stroke:#f57c00
+    style Retriever fill:#f3e5f5,stroke:#7b1fa2
+    style Vec fill:#e8f5e9,stroke:#388e3c
+    style DB fill:#e8f5e9,stroke:#388e3c
+```
+
+### Ingestion Path (runs once per document upload)
+
+```mermaid
+flowchart TD
+    Upload([Uploaded Document<br/>PDF / MD / text]) --> Chunker[Chunker + Cleaner<br/>overlap + metadata]
+    Chunker --> Embed[OpenAI Embeddings<br/>text-embedding-3-small]
+    Embed --> Store[(pgvector on Supabase<br/>chunk + vector + tenant_id with RLS)]
+
+    style Upload fill:#e1f5ff,stroke:#0288d1
+    style Store fill:#e8f5e9,stroke:#388e3c
+    style Embed fill:#fff4e1,stroke:#f57c00
+```
+
+**Flow explained:**
+
+*Query path (when a user asks a question):*
+1. User types a question in the Next.js chat UI
+2. API route receives the query and fetches conversation history from Postgres (scoped by RLS to the user's tenant)
+3. The query is embedded via OpenAI `text-embedding-3-small`
+4. Hybrid retriever queries pgvector (semantic similarity) *and* runs keyword ranking, merging results for top-K chunks
+5. Retrieved chunks + conversation history are sent to Claude with instructions to generate a grounded, citation-anchored response
+6. Claude streams tokens back; the UI renders them live and shows citations inline, linked to the source chunks
+7. The full conversation turn is persisted to Postgres for memory and cost tracking
+
+*Ingestion path (when docs are uploaded):*
+1. Documents are uploaded and chunked with overlap to preserve semantic context
+2. Each chunk is embedded and stored in pgvector alongside its metadata and `tenant_id`
+3. Supabase RLS policies enforce that chunks are only retrievable by the owning tenant
+---
 
 ## Tech Stack
 
